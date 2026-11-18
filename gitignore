@@ -1,0 +1,6 @@
+exiftool_bundle/
+dist/
+build/
+.build_venv/
+*.spec
+.DS_Store
