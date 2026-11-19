@@ -35,7 +35,7 @@ cd "$WORK"
 
 python3 -m venv venv
 source venv/bin/activate
-pip install --quiet --upgrade pip pyinstaller pillow
+pip install --quiet --upgrade pip pyinstaller pillow certifi
 
 pyinstaller --noconfirm --clean --windowed \
   --name "FHU Photo Tagger" \

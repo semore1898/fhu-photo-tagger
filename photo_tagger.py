@@ -23,9 +23,12 @@ import re
 import shutil
 import subprocess
 import sys
+import ssl
 import tempfile
 import threading
 import tkinter as tk
+import urllib.request
+from html.parser import HTMLParser
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -203,6 +206,114 @@ def process(exiftool, folder, sport, opponent, date, log, done):
         done()
 
 
+# --------------------------------------------------------------- roster import
+class _RosterParser(HTMLParser):
+    """Pulls player names out of a Sidearm roster page."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables, self.links = [], []
+        self._table = self._row = self._cell = None
+        self._skip = 0
+        self._href = None
+        self._link_text = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag == "table":
+            self._table = []
+            self.tables.append(self._table)
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+            self._table.append(self._row)
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+        elif tag == "a":
+            href = a.get("href") or ""
+            if re.search(r"/roster/[^/?#]+/\d+", href):
+                self._href, self._link_text = href, []
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        elif tag in ("td", "th") and self._cell is not None:
+            self._row.append(re.sub(r"\s+", " ", " ".join(self._cell)).strip())
+            self._cell = None
+        elif tag == "tr":
+            self._row = None
+        elif tag == "table":
+            self._table = None
+        elif tag == "a" and self._href:
+            text = re.sub(r"\s+", " ", " ".join(self._link_text)).strip()
+            if text:
+                self.links.append(text)
+            self._href = None
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        d = data.strip()
+        if not d:
+            return
+        if self._cell is not None:
+            self._cell.append(d)
+        if self._href:
+            self._link_text.append(d)
+
+
+def parse_roster_names(html):
+    p = _RosterParser()
+    p.feed(html)
+    names = []
+
+    def add(n):
+        n = re.sub(r"^\d+\s+", "", n).strip()
+        if (n and not re.search(r"\d", n) and 1 <= len(n.split()) <= 5
+                and n not in names):
+            names.append(n)
+
+    for table in p.tables:
+        header_i = None
+        for r_i, row in enumerate(table):
+            low = [c.lower() for c in row]
+            if "title" in low:
+                break  # coaching staff table
+            col = next((k for k, c in enumerate(low)
+                        if c in ("name", "full name", "player")), None)
+            if col is not None:
+                header_i = (r_i, col)
+                break
+        if not header_i:
+            continue
+        r_i, col = header_i
+        for row in table[r_i + 1:]:
+            if len(row) > col:
+                add(row[col])
+    if not names:  # fallback: player-page links
+        for text in p.links:
+            if re.fullmatch(r"[A-Za-z.'’\- ]+", text) and "bio" not in text.lower():
+                add(text)
+    return names
+
+
+def fetch_html(url):
+    url = url.strip()
+    if not url.lower().startswith("http"):
+        url = "https://" + url
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa
+        ctx = ssl.create_default_context()
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Safari/605.1.15"})
+    with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
 # --------------------------------------------------------------------- GUI
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".fhu_photo_tagger.json")
 
@@ -247,18 +358,30 @@ def list_photos(folder):
 
 class TaggerTab(ttk.Frame):
     """Step 1: look at each photo and type the player name(s)."""
-    W, H = 820, 500
+    W, H = 820, 460
 
-    def __init__(self, parent, exiftool, cfg):
+    def __init__(self, parent, exiftool, cfg, sport_var):
         super().__init__(parent)
         self.exiftool = exiftool
         self.cfg = cfg
-        self.roster = list(cfg.get("roster", []))
+        self.sport_var = sport_var
+        self.roster = []
         self.files, self.i, self.photo = [], 0, None
-        self.prev_names, self.matches = [], []
+        self.prev_names = []
+
+        srow = ttk.Frame(self)
+        srow.pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Label(srow, text="Sport").pack(side="left")
+        ttk.Combobox(srow, textvariable=sport_var, values=SPORTS,
+                     width=22).pack(side="left", padx=6)
+        self.roster_label = ttk.Label(srow, text="")
+        self.roster_label.pack(side="left", padx=6)
+        ttk.Button(srow, text="Edit roster...",
+                   command=self.edit_roster).pack(side="right")
+        sport_var.trace_add("write", lambda *a: self.load_roster())
 
         self.info = ttk.Label(self, text="Choose a photo folder above.")
-        self.info.pack(anchor="w", padx=10, pady=(8, 2))
+        self.info.pack(anchor="w", padx=10, pady=(4, 2))
 
         box = tk.Frame(self, width=self.W, height=self.H, bg="#222")
         box.pack(padx=10)
@@ -266,19 +389,31 @@ class TaggerTab(ttk.Frame):
         self.img_label = tk.Label(box, bg="#222")
         self.img_label.pack(expand=True)
 
-        ttk.Label(self, text="Player name(s). Separate multiple players with "
-                  "commas. Tab = autocomplete, Enter = save and next."
+        ttk.Label(self, text="Click player names below (click again to undo), "
+                  "or type. Enter = save and next."
                   ).pack(anchor="w", padx=10, pady=(8, 2))
         self.var = tk.StringVar()
         self.entry = ttk.Entry(self, textvariable=self.var, font=("", 14))
         self.entry.pack(fill="x", padx=10)
-        self.var.trace_add("write", lambda *a: self.filter())
+        self.var.trace_add("write", lambda *a: self.sync())
         self.entry.bind("<Return>", lambda e: self.save_next())
-        self.entry.bind("<Tab>", self.on_tab)
 
-        self.listbox = tk.Listbox(self, height=4, exportselection=False)
-        self.listbox.pack(fill="x", padx=10, pady=4)
-        self.listbox.bind("<<ListboxSelect>>", self.pick_match)
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True, padx=10, pady=4)
+        self.canvas = tk.Canvas(wrap, height=150, highlightthickness=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.btn_frame = ttk.Frame(self.canvas)
+        self.canvas.create_window((0, 0), window=self.btn_frame, anchor="nw")
+        self.btn_frame.bind("<Configure>", lambda e: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all(
+            "<MouseWheel>", self.on_wheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+        self.buttons = {}
+        self.syncing = False
 
         row = ttk.Frame(self)
         row.pack(pady=4)
@@ -288,11 +423,87 @@ class TaggerTab(ttk.Frame):
         ttk.Button(row, text="Skip", command=self.skip).pack(side="left", padx=3)
         ttk.Button(row, text="Save and next (Enter)",
                    command=self.save_next).pack(side="left", padx=3)
-        ttk.Button(row, text="Edit roster...",
-                   command=self.edit_roster).pack(side="left", padx=(20, 3))
 
         self.status = ttk.Label(self, text="")
         self.status.pack(anchor="w", padx=10)
+        self.load_roster()
+
+    # ---- roster
+    def load_roster(self):
+        sport = self.sport_var.get().strip()
+        self.roster = list(self.cfg.get("rosters", {}).get(sport, []))
+        if not sport:
+            msg = "Pick a sport to load its roster"
+        elif self.roster:
+            msg = f"{len(self.roster)} players on roster"
+        else:
+            msg = "No roster saved yet. Click Edit roster."
+        self.roster_label.config(text=msg)
+        self.build_buttons()
+
+    def edit_roster(self):
+        sport = self.sport_var.get().strip()
+        if not sport:
+            messagebox.showinfo("Pick a sport", "Choose a sport first.")
+            return
+        win = tk.Toplevel(self)
+        win.title(f"{sport} roster")
+        win.geometry("460x600")
+        ttk.Label(win, text="Roster page web address (e.g. the gofhulions.com "
+                  "roster page for this team)").pack(anchor="w", padx=10,
+                                                     pady=(10, 2))
+        url_var = tk.StringVar(value=self.cfg.get("roster_urls", {}).get(sport, ""))
+        urow = ttk.Frame(win)
+        urow.pack(fill="x", padx=10)
+        ttk.Entry(urow, textvariable=url_var).pack(side="left", fill="x",
+                                                   expand=True)
+        text = tk.Text(win)
+
+        def do_import():
+            url = url_var.get().strip()
+            if not url:
+                messagebox.showinfo("Web address", "Paste the roster page "
+                                    "address first.", parent=win)
+                return
+            win.config(cursor="watch")
+            win.update_idletasks()
+            try:
+                names = parse_roster_names(fetch_html(url))
+            except Exception as e:  # noqa
+                win.config(cursor="")
+                messagebox.showerror("Couldn't load the page", str(e), parent=win)
+                return
+            win.config(cursor="")
+            if not names:
+                messagebox.showwarning(
+                    "No names found",
+                    "That page didn't have a roster table I could read. You "
+                    "can still paste the names below, one per line.",
+                    parent=win)
+                return
+            text.delete("1.0", "end")
+            text.insert("1.0", "\n".join(names))
+            status.config(text=f"Found {len(names)} names. Check them, then "
+                               "click Save roster.")
+
+        ttk.Button(urow, text="Import", command=do_import).pack(side="left",
+                                                                padx=(6, 0))
+        status = ttk.Label(win, text="One player per line. You can edit the "
+                           "list by hand.")
+        status.pack(anchor="w", padx=10, pady=6)
+        text.pack(fill="both", expand=True, padx=10)
+        text.insert("1.0", "\n".join(self.roster))
+
+        def save():
+            names = [ln.strip() for ln in text.get("1.0", "end").splitlines()
+                     if ln.strip()]
+            self.cfg.setdefault("rosters", {})[sport] = names
+            self.cfg.setdefault("roster_urls", {})[sport] = url_var.get().strip()
+            save_config(self.cfg)
+            win.destroy()
+            self.load_roster()
+
+        ttk.Button(win, text="Save roster", command=save).pack(pady=8)
 
     # ---- loading / showing
     def load(self, folder):
@@ -334,34 +545,70 @@ class TaggerTab(ttk.Frame):
         self.status.config(text="Already tagged. Edit or press Enter to keep."
                            if existing else "")
 
-    # ---- autocomplete
-    def token(self):
-        return self.var.get().rsplit(",", 1)[-1].strip()
+    # ---- name buttons
+    COLS = 4
 
-    def filter(self):
+    def on_wheel(self, e):
+        step = -e.delta if sys.platform == "darwin" else -e.delta // 120
+        self.canvas.yview_scroll(int(step), "units")
+
+    def build_buttons(self):
+        for w in self.btn_frame.winfo_children():
+            w.destroy()
+        self.buttons = {}
+        for k in range(self.COLS):
+            self.btn_frame.columnconfigure(k, weight=1)
+        for name in self.roster:
+            v = tk.BooleanVar(value=False)
+            b = ttk.Checkbutton(self.btn_frame, text=name, variable=v,
+                                style="Toolbutton", width=20,
+                                command=lambda n=name: self.toggle(n))
+            self.buttons[name] = (b, v)
+        self.layout_buttons(list(self.roster))
+        self.sync()
+
+    def layout_buttons(self, show):
+        for b, _ in self.buttons.values():
+            b.grid_forget()
+        for idx, name in enumerate(show):
+            self.buttons[name][0].grid(row=idx // self.COLS, column=idx % self.COLS,
+                                       padx=2, pady=2, sticky="ew")
+        self.canvas.yview_moveto(0)
+
+    def sync(self):
+        """Keep the buttons in step with what's typed in the box."""
+        if self.syncing or not self.buttons:
+            return
+        typed = {n.lower() for n in self.parse()}
+        for name, (_, v) in self.buttons.items():
+            v.set(name.lower() in typed)
+        # Narrow the buttons while a partial name is being typed
         t = self.token().lower()
-        self.matches = ([n for n in self.roster if t in n.lower()][:20]
-                        if t else [])
-        self.listbox.delete(0, "end")
-        for n in self.matches:
-            self.listbox.insert("end", n)
+        exact = any(t == n.lower() for n in self.roster)
+        if t and not exact:
+            show = [n for n in self.roster if t in n.lower()]
+        else:
+            show = list(self.roster)
+        shown_now = [n for n, (b, _) in self.buttons.items() if b.winfo_manager()]
+        if show != shown_now:
+            self.layout_buttons(show)
 
-    def complete(self, name):
-        text = self.var.get()
-        head = text.rsplit(",", 1)[0] + ", " if "," in text else ""
-        self.var.set(head + name)
+    def toggle(self, name):
+        names = self.parse()
+        lower = [n.lower() for n in names]
+        if name.lower() in lower:
+            names = [n for n in names if n.lower() != name.lower()]
+        else:
+            names.append(name)
+        self.syncing = True
+        self.var.set(", ".join(names))
+        self.syncing = False
+        self.sync()
         self.entry.focus_set()
         self.entry.icursor("end")
 
-    def on_tab(self, _event):
-        if self.matches:
-            self.complete(self.matches[0])
-        return "break"
-
-    def pick_match(self, _event):
-        sel = self.listbox.curselection()
-        if sel and sel[0] < len(self.matches):
-            self.complete(self.matches[sel[0]])
+    def token(self):
+        return self.var.get().rsplit(",", 1)[-1].strip()
 
     # ---- actions
     def parse(self):
@@ -417,31 +664,11 @@ class TaggerTab(ttk.Frame):
             self.entry.focus_set()
             self.entry.icursor("end")
 
-    def edit_roster(self):
-        win = tk.Toplevel(self)
-        win.title("Roster")
-        win.geometry("360x480")
-        ttk.Label(win, text="One player per line (paste from the roster page)."
-                  ).pack(anchor="w", padx=10, pady=6)
-        text = tk.Text(win)
-        text.pack(fill="both", expand=True, padx=10)
-        text.insert("1.0", "\n".join(self.roster))
 
-        def save():
-            self.roster = [ln.strip() for ln in
-                           text.get("1.0", "end").splitlines() if ln.strip()]
-            self.cfg["roster"] = self.roster
-            save_config(self.cfg)
-            win.destroy()
-            self.filter()
-
-        ttk.Button(win, text="Save roster", command=save).pack(pady=8)
-
-
-def build_rename_tab(parent, exiftool, folder_var):
+def build_rename_tab(parent, exiftool, folder_var, sport_var):
     """Step 2: caption, headline, and rename."""
     pad = {"padx": 10, "pady": 4}
-    sport_var, opp_var, date_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+    opp_var, date_var = tk.StringVar(), tk.StringVar()
 
     ttk.Label(parent, text="Uses the player names saved in step 1. Tagged "
               "copies go into a 'Tagged' folder.").pack(anchor="w", **pad)
@@ -494,7 +721,7 @@ def main():
     exiftool = find_exiftool()
     root = tk.Tk()
     root.title("FHU Photo Tagger")
-    root.geometry("880x940")
+    root.geometry("880x960")
 
     if not exiftool:
         messagebox.showerror(
@@ -508,6 +735,11 @@ def main():
 
     cfg = load_config()
     folder_var = tk.StringVar(value=cfg.get("folder", ""))
+    sport_var = tk.StringVar(value=cfg.get("sport", ""))
+
+    def remember_sport(*_):
+        cfg["sport"] = sport_var.get().strip()
+        save_config(cfg)
 
     top = ttk.Frame(root)
     top.pack(fill="x", padx=10, pady=(10, 4))
@@ -521,9 +753,10 @@ def main():
     nb.add(tab1, text="1. Tag players")
     nb.add(tab2, text="2. Caption and rename")
 
-    tagger = TaggerTab(tab1, exiftool, cfg)
+    tagger = TaggerTab(tab1, exiftool, cfg, sport_var)
     tagger.pack(fill="both", expand=True)
-    build_rename_tab(tab2, exiftool, folder_var)
+    build_rename_tab(tab2, exiftool, folder_var, sport_var)
+    sport_var.trace_add("write", remember_sport)
 
     def pick():
         d = filedialog.askdirectory(title="Folder of photos")
