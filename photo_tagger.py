@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-FHU Photo Tagger
-----------------
+Photo Tagger
+------------
 Step 1: view each photo and type the player name(s) into its Keywords metadata.
 Step 2: reads those keywords, then writes:
   - Headline  -> first initial + last name, lowercase (multiple players separated by a space)
-  - Caption   -> "NAME in FHU's SPORT game/match against OPPONENT on DATE"
+  - Caption   -> "NAME in TEAM's SPORT game/match against OPPONENT on DATE"
 and saves a renamed copy as HEADLINE-vs-opponent.jpg (hyphens instead of spaces).
 
 Step 1 writes keywords directly into the photos in the folder you pick.
@@ -60,21 +60,21 @@ def find_exiftool():
     here = os.path.dirname(os.path.abspath(__file__))
     names = ["exiftool.exe", "exiftool"] if os.name == "nt" else ["exiftool"]
     # Packaged .app: exiftool is bundled in "exiftool_bundle"
-    bases = [getattr(sys, "_MEIPASS", None), here]
+    bases = [b for b in (getattr(sys, "_MEIPASS", None), here) if b]
+    if os.name != "nt":
+        for base in bases:
+            p = os.path.join(base, "exiftool_bundle", "exiftool")
+            if os.path.isfile(p):
+                try:
+                    os.chmod(p, 0o755)
+                except OSError:
+                    pass
+                return p
     for base in bases:
-        if not base:
-            continue
-        p = os.path.join(base, "exiftool_bundle", "exiftool")
-        if os.path.isfile(p):
-            try:
-                os.chmod(p, 0o755)
-            except OSError:
-                pass
-            return p
-    for n in names:
-        p = os.path.join(here, n)
-        if os.path.isfile(p):
-            return p
+        for n in names:
+            p = os.path.join(base, n)
+            if os.path.isfile(p):
+                return p
     found = shutil.which("exiftool")
     if found:
         return found
@@ -82,6 +82,11 @@ def find_exiftool():
         if os.path.isfile(p):
             return p
     return None
+
+
+def safe(text):
+    """Flatten line breaks and control characters in anything we hand to ExifTool."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(text)).strip()
 
 
 def run(cmd):
@@ -103,7 +108,7 @@ def read_keywords(exiftool, path):
         raw = [raw]
     names = []
     for item in raw:
-        for part in re.split(r"[;,]", str(item)):
+        for part in re.split(r"[;,]", safe(item)):
             part = part.strip()
             if part and part not in names:
                 names.append(part)
@@ -125,6 +130,11 @@ def handle(name):
     return (clean_word(words[0])[0] + clean_word(words[-1])).lower()
 
 
+def possessive(team):
+    """FHU -> FHU's, Lions -> Lions' (AP style for names ending in s)."""
+    return team + ("'" if team.lower().endswith("s") else "'s")
+
+
 def join_names(names):
     if len(names) == 1:
         return names[0]
@@ -139,8 +149,10 @@ def slug(text):
     return text.strip("-")
 
 
-def process(exiftool, folder, sport, opponent, date, log, done):
+def process(exiftool, folder, team, sport, opponent, date, log, done):
     try:
+        team, sport, opponent, date = (safe(team), safe(sport), safe(opponent),
+                                       safe(date))
         out = os.path.join(folder, "Tagged")
         os.makedirs(out, exist_ok=True)
         noun = "match" if is_match_sport(sport) else "game"
@@ -159,15 +171,15 @@ def process(exiftool, folder, sport, opponent, date, log, done):
             handles = [handle(n) for n in names if handle(n)]
             if handles:
                 headline = " ".join(handles)
-                caption = (f"{join_names(names)} in FHU's {sport.lower()} "
+                caption = (f"{join_names(names)} in {possessive(team)} {sport.lower()} "
                            f"{noun} against {opponent} on {date}")
                 base = f"{'-'.join(handles)}-vs-{opp_slug}"
             else:
                 # No keyword: generic caption, no headline, generic filename
                 headline = ""
-                caption = (f"FHU {sport.lower()} in action against "
+                caption = (f"{team} {sport.lower()} in action against "
                            f"{opponent} on {date}")
-                base = f"fhu-{slug(sport)}-vs-{opp_slug}"
+                base = f"{slug(team)}-{slug(sport)}-vs-{opp_slug}"
                 log(f"No keyword on {f} (used generic caption)")
                 skipped += 1
             count = used.get(base, 0) + 1
@@ -315,15 +327,18 @@ def fetch_html(url):
 
 
 # --------------------------------------------------------------------- GUI
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".fhu_photo_tagger.json")
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".photo_tagger.json")
+OLD_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".fhu_photo_tagger.json")
 
 
 def load_config():
-    try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:  # noqa
-        return {}
+    for path in (CONFIG_PATH, OLD_CONFIG_PATH):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:  # noqa
+            continue
+    return {}
 
 
 def save_config(cfg):
@@ -339,7 +354,7 @@ def write_keywords(exiftool, path, names):
     args = ["-charset", "utf8", "-codedcharacterset=utf8",
             "-overwrite_original", "-m",
             "-IPTC:Keywords=", "-XMP-dc:Subject="]
-    for n in names:
+    for n in map(safe, names):
         args += [f"-IPTC:Keywords+={n}", f"-XMP-dc:Subject+={n}"]
     args.append(path)
     with tempfile.NamedTemporaryFile("w", suffix=".args", delete=False,
@@ -449,8 +464,8 @@ class TaggerTab(ttk.Frame):
         win = tk.Toplevel(self)
         win.title(f"{sport} roster")
         win.geometry("460x600")
-        ttk.Label(win, text="Roster page web address (e.g. the gofhulions.com "
-                  "roster page for this team)").pack(anchor="w", padx=10,
+        ttk.Label(win, text="Roster page web address (the roster page for this team on "
+                  "your school's athletics site)").pack(anchor="w", padx=10,
                                                      pady=(10, 2))
         url_var = tk.StringVar(value=self.cfg.get("roster_urls", {}).get(sport, ""))
         urow = ttk.Frame(win)
@@ -665,14 +680,18 @@ class TaggerTab(ttk.Frame):
             self.entry.icursor("end")
 
 
-def build_rename_tab(parent, exiftool, folder_var, sport_var):
+def build_rename_tab(parent, exiftool, folder_var, sport_var, team_var):
     """Step 2: caption, headline, and rename."""
     pad = {"padx": 10, "pady": 4}
     opp_var, date_var = tk.StringVar(), tk.StringVar()
 
     ttk.Label(parent, text="Uses the player names saved in step 1. Tagged "
               "copies go into a 'Tagged' folder.").pack(anchor="w", **pad)
-    ttk.Label(parent, text="Sport").pack(anchor="w", **pad)
+    ttk.Label(parent, text="Your team or school name (e.g. FHU)"
+              ).pack(anchor="w", **pad)
+    ttk.Entry(parent, textvariable=team_var).pack(fill="x", **pad)
+    ttk.Label(parent, text="Sport (pick one or type your own, e.g. "
+              "Women's Tennis)").pack(anchor="w", **pad)
     ttk.Combobox(parent, textvariable=sport_var, values=SPORTS).pack(fill="x", **pad)
     ttk.Label(parent, text="Opponent (e.g. Cumberlands)").pack(anchor="w", **pad)
     ttk.Entry(parent, textvariable=opp_var).pack(fill="x", **pad)
@@ -695,11 +714,13 @@ def build_rename_tab(parent, exiftool, folder_var, sport_var):
 
     def go():
         folder = folder_var.get().strip()
+        team = team_var.get().strip()
         sport, opp, date = (sport_var.get().strip(), opp_var.get().strip(),
                             date_var.get().strip())
-        if not (folder and sport and opp and date):
-            messagebox.showwarning("Missing info",
-                                   "Fill in the folder, sport, opponent, and date.")
+        if not (folder and team and sport and opp and date):
+            messagebox.showwarning(
+                "Missing info",
+                "Fill in the folder, team name, sport, opponent, and date.")
             return
         if not os.path.isdir(folder):
             messagebox.showwarning("Folder not found", folder)
@@ -709,7 +730,7 @@ def build_rename_tab(parent, exiftool, folder_var, sport_var):
         logbox.delete("1.0", "end")
         logbox.config(state="disabled")
         threading.Thread(target=process,
-                         args=(exiftool, folder, sport, opp, date, log, finished),
+                         args=(exiftool, folder, team, sport, opp, date, log, finished),
                          daemon=True).start()
 
     run_btn.config(command=go)
@@ -720,7 +741,7 @@ def build_rename_tab(parent, exiftool, folder_var, sport_var):
 def main():
     exiftool = find_exiftool()
     root = tk.Tk()
-    root.title("FHU Photo Tagger")
+    root.title("Photo Tagger")
     root.geometry("880x960")
 
     if not exiftool:
@@ -736,6 +757,7 @@ def main():
     cfg = load_config()
     folder_var = tk.StringVar(value=cfg.get("folder", ""))
     sport_var = tk.StringVar(value=cfg.get("sport", ""))
+    team_var = tk.StringVar(value=cfg.get("team", ""))
 
     def remember_sport(*_):
         cfg["sport"] = sport_var.get().strip()
@@ -755,8 +777,14 @@ def main():
 
     tagger = TaggerTab(tab1, exiftool, cfg, sport_var)
     tagger.pack(fill="both", expand=True)
-    build_rename_tab(tab2, exiftool, folder_var, sport_var)
+    build_rename_tab(tab2, exiftool, folder_var, sport_var, team_var)
     sport_var.trace_add("write", remember_sport)
+
+    def remember_team(*_):
+        cfg["team"] = team_var.get().strip()
+        save_config(cfg)
+
+    team_var.trace_add("write", remember_team)
 
     def pick():
         d = filedialog.askdirectory(title="Folder of photos")

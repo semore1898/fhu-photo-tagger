@@ -1,0 +1,15 @@
+# ExifTool is downloaded separately (see README); don't commit it
+exiftool_bundle/
+exiftool.exe
+exiftool_files/
+
+# Build output
+dist/
+build/
+*.spec
+.build_venv/
+venv/
+__pycache__/
+
+# macOS
+.DS_Store

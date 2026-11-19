@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds "FHU Photo Tagger.app" on a Mac.
+# Builds "Photo Tagger.app" on a Mac.
 # Run from the folder that holds photo_tagger.py:  bash build_mac_app.sh
 #
 # Before running, put ExifTool next to this script:
@@ -38,16 +38,16 @@ source venv/bin/activate
 pip install --quiet --upgrade pip pyinstaller pillow certifi
 
 pyinstaller --noconfirm --clean --windowed \
-  --name "FHU Photo Tagger" \
+  --name "Photo Tagger" \
   --add-data "exiftool_bundle:exiftool_bundle" \
   photo_tagger.py
 
 deactivate
 
 mkdir -p "$HERE/dist"
-rm -rf "$HERE/dist/FHU Photo Tagger.app"
-cp -R "dist/FHU Photo Tagger.app" "$HERE/dist/"
+rm -rf "$HERE/dist/Photo Tagger.app"
+cp -R "dist/Photo Tagger.app" "$HERE/dist/"
 
 echo
-echo "Done. Your app is in:  $HERE/dist/FHU Photo Tagger.app"
+echo "Done. Your app is in:  $HERE/dist/Photo Tagger.app"
 echo "Drag it into Applications (or the Dock)."
